@@ -11,6 +11,7 @@ struct Access: Identifiable, Codable {
     var login = ""
     var icon = "git.branch"
     var link = ""
+    var description: String?
 }
 
 struct Note: Identifiable, Codable {
@@ -329,7 +330,9 @@ struct NotepadView: View {
     private let cardSpacing: CGFloat = 10
     private let cardsPerPage = 3
     private let contentHeight: CGFloat = 310
-    private var cardHeight: CGFloat { contentHeight - 2 * panelPadding }
+    private let accessStatusHeight: CGFloat = 16
+    private let accessStatusSpacing: CGFloat = 6
+    private var cardHeight: CGFloat { contentHeight - 2 * panelPadding - accessStatusHeight - accessStatusSpacing }
 
     private let icons = ["externaldrive", "switch.2", "git.branch", "server.rack", "house", "key"]
     private let iconLabels = ["VPS", "3x-UI", "GitHub", "Сервер", "Админка", "Другое"]
@@ -406,23 +409,36 @@ struct NotepadView: View {
                 .padding(10)
                 .frame(height: contentHeight)
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 10) {
-                            if let editing = panel.editing {
-                                editor(editing).id(editing.id)
-                            }
-                            if accesses.isEmpty && panel.editing == nil {
-                                Text("Добавь первый рабочий доступ.").foregroundStyle(.secondary)
-                            }
-                            if !accesses.isEmpty { accessStrip }
-                            if !panel.status.isEmpty { Text(panel.status).foregroundStyle(.secondary) }
-                        }.padding(panelPadding)
+                VStack(alignment: .leading, spacing: accessStatusSpacing) {
+                    ZStack(alignment: .topLeading) {
+                        if accesses.isEmpty {
+                            Text("Добавь первый рабочий доступ.").foregroundStyle(.secondary)
+                        } else {
+                            accessStrip
+                        }
                     }
-                    .onChange(of: panel.editing?.id) { id in
-                        if let id { proxy.scrollTo(id, anchor: .top) }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .frame(height: cardHeight, alignment: .topLeading)
+                    .allowsHitTesting(panel.editing == nil)
+                    .accessibilityHidden(panel.editing != nil)
+                    .overlay {
+                        if let editing = panel.editing {
+                            ScrollView {
+                                editor(editing)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .background(Palette.paper)
+                        }
                     }
-                }.frame(height: contentHeight)
+                    Text(panel.status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(height: accessStatusHeight, alignment: .leading)
+                        .help(panel.status)
+                }
+                .padding(panelPadding)
+                .frame(width: panelWidth, height: contentHeight, alignment: .topLeading)
             }
         }
         .disabled(panel.deleting != nil)
@@ -468,35 +484,32 @@ struct NotepadView: View {
     private var accessStrip: some View {
         let viewportWidth = panelWidth - 2 * panelPadding
         let cardWidth = (viewportWidth - CGFloat(cardsPerPage - 1) * cardSpacing) / CGFloat(cardsPerPage)
-        let pageStarts = Array(stride(from: 0, to: accesses.count, by: cardsPerPage))
 
         return ScrollViewReader { proxy in
-            let pages = ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 0) {
-                    ForEach(pageStarts, id: \.self) { start in
-                        HStack(alignment: .top, spacing: cardSpacing) {
-                            ForEach(accesses.dropFirst(start).prefix(cardsPerPage)) { access in
-                                card(access)
-                                    .frame(width: cardWidth)
-                            }
-                        }
-                        .frame(width: viewportWidth, alignment: .leading)
-                        .id(start)
-                    }
+            let cards = HStack(alignment: .top, spacing: cardSpacing) {
+                ForEach(accesses) { access in
+                    card(access)
+                        .frame(width: cardWidth)
+                        .id(access.id)
                 }
             }
             Group {
-                if #available(macOS 14, *) {
-                    pages.scrollTargetBehavior(.paging)
+                if #available(macOS 15, *) {
+                    ScrollView(.horizontal) { cards.scrollTargetLayout() }
+                        .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
+                } else if #available(macOS 14, *) {
+                    ScrollView(.horizontal) { cards.scrollTargetLayout() }
+                        .scrollTargetBehavior(.viewAligned)
                 } else {
-                    pages
+                    ScrollView(.horizontal) { cards }
                 }
             }
-            .frame(width: viewportWidth)
+            .scrollIndicators(.hidden)
+            .frame(width: viewportWidth, height: cardHeight)
             .accessibilityLabel("Карточки доступов")
             .onChange(of: accesses.count) { count in
-                if count > panel.lastAccessCount, let lastPage = pageStarts.last {
-                    proxy.scrollTo(lastPage, anchor: .leading)
+                if count > panel.lastAccessCount, let lastCard = accesses.last {
+                    proxy.scrollTo(lastCard.id, anchor: .trailing)
                 }
                 panel.lastAccessCount = count
             }
@@ -666,14 +679,27 @@ struct NotepadView: View {
                 copy(access.login, label: "Логин")
             }
             passwordRow(access)
-            Spacer(minLength: 12)
+            Button {
+                startAccessEdit(access)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Описание").foregroundStyle(.secondary)
+                    if let description = access.description, !description.isEmpty {
+                        Text(description)
+                            .foregroundStyle(accessTextColor.color)
+                            .lineLimit(3)
+                    }
+                }
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Редактировать описание")
+            Spacer(minLength: 0)
             HStack(spacing: 6) {
                 iconButton("slider.horizontal.3", label: "Изменить доступ") {
-                    panel.hidePassword()
-                    panel.cancelPasswordEdit()
-                    panel.editing = access
-                    panel.password = ""
-                    panel.status = ""
+                    startAccessEdit(access)
                 }
                 Spacer(minLength: 0)
                 passwordControls(access.id)
@@ -692,17 +718,20 @@ struct NotepadView: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, minHeight: cardHeight - 18, alignment: .topLeading)
         .padding(9)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: cardHeight, alignment: .topLeading)
         .background(Palette.paper, in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Palette.line))
     }
 
-    private func credentialRow(_ name: String, value: String, action: @escaping () -> Void) -> some View {
+    private func credentialRow(_ name: String, value: String, multiline: Bool = false,
+                               action: @escaping () -> Void) -> some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.caption).foregroundStyle(.secondary)
-                Text(value).lineLimit(1).truncationMode(.middle).foregroundStyle(accessTextColor.color).textSelection(.enabled)
+                Text(value).lineLimit(multiline ? nil : 1).truncationMode(.middle)
+                    .foregroundStyle(accessTextColor.color).textSelection(.enabled)
             }
             Spacer(minLength: 0)
             iconButton("square.on.square", label: "Скопировать: " + name.lowercased(),
@@ -714,23 +743,11 @@ struct NotepadView: View {
         let visible = panel.revealed?.id == access.id
         let editing = panel.passwordEdit == access.id
         return VStack(alignment: .leading, spacing: 5) {
-            Text("Пароль").font(.caption).foregroundStyle(.secondary)
-            HStack(alignment: .center, spacing: 4) {
-                Text(visible ? panel.revealed?.value ?? "" : "••••••••")
-                    .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(accessTextColor.color)
-                    .lineLimit(visible ? nil : 1)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                iconButton("square.on.square", label: "Скопировать пароль", color: Palette.copyIcon) {
-                    do { copy(try Vault.read(access.id), label: "Пароль", secret: true) }
-                    catch { panel.status = error.localizedDescription }
-                }
+            credentialRow("Пароль", value: visible ? panel.revealed?.value ?? "" : "••••••••",
+                          multiline: visible) {
+                do { copy(try Vault.read(access.id), label: "Пароль", secret: true) }
+                catch { panel.status = error.localizedDescription }
             }
-            .padding(.leading, 5)
-            .padding(.vertical, 5)
-            .background(Palette.soft.opacity(0.35), in: RoundedRectangle(cornerRadius: 7))
-            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Palette.line).allowsHitTesting(false))
 
             if editing {
                 SecureField("Новый пароль", text: $panel.passwordDraft)
@@ -825,6 +842,14 @@ struct NotepadView: View {
         }
     }
 
+    private func startAccessEdit(_ access: Access) {
+        panel.hidePassword()
+        panel.cancelPasswordEdit()
+        panel.editing = access
+        panel.password = ""
+        panel.status = ""
+    }
+
     private func editor(_ access: Access) -> some View {
         let existing = accesses.contains { $0.id == access.id }
         return VStack(alignment: .leading, spacing: 7) {
@@ -833,6 +858,18 @@ struct NotepadView: View {
             TextField("Логин", text: field(\.login))
             SecureField(existing ? "Новый пароль (необязательно)" : "Пароль", text: $panel.password)
             TextField("Ссылка (необязательно)", text: field(\.link))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Описание (необязательно)").foregroundStyle(.secondary)
+                TextEditor(text: Binding(
+                    get: { panel.editing?.description ?? "" },
+                    set: { panel.editing?.description = $0.isEmpty ? nil : $0 }
+                ))
+                .scrollContentBackground(.hidden)
+                .frame(height: 54)
+                .background(Palette.soft, in: RoundedRectangle(cornerRadius: 5))
+                .accessibilityLabel("Описание")
+            }
+            .font(.caption)
             Picker("Значок", selection: field(\.icon)) {
                 ForEach(icons.indices, id: \.self) { index in
                     Text(iconLabels[index]).tag(icons[index])
