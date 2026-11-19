@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Darwin
 import Security
 import ServiceManagement
@@ -19,8 +20,34 @@ struct Note: Identifiable, Codable {
     var text = ""
 }
 
+private enum NotepadIdentity {
+    static let current = "local.kraken.menu-notepad"
+
+    // The fingerprint identifies the previous preferences domain without shipping its name.
+    static let previous: String? = {
+        let fingerprint = "24479291f7f53358f6f39855babaf7c097af6ade26df589a289a7d655461b1cf"
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Preferences", isDirectory: true)
+        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        return files.lazy.filter { $0.pathExtension == "plist" }
+            .map { $0.deletingPathExtension().lastPathComponent }
+            .first { domain in
+                guard domain.hasPrefix("local."), domain.hasSuffix(".menu-notepad") else { return false }
+                return SHA256.hash(data: Data(domain.utf8)).map { String(format: "%02x", $0) }.joined() == fingerprint
+            }
+    }()
+
+    static func importPreferences() {
+        guard let previous, let old = UserDefaults.standard.persistentDomain(forName: previous) else { return }
+        let defaults = UserDefaults.standard
+        for key in ["accesses", "notes", "accessTextColor"] where defaults.object(forKey: key) == nil {
+            if let value = old[key] { defaults.set(value, forKey: key) }
+        }
+    }
+}
+
 enum Vault {
-    private static let service = "local.dmitry.menu-notepad"
+    private static let service = NotepadIdentity.current
     private static let sharedAccount = "passwords-v2"
 
     static func read(_ id: UUID) throws -> String {
@@ -28,7 +55,8 @@ enum Vault {
             var entries = try load()
             if let password = entries[id.uuidString] { return password }
 
-            guard let legacy = try readData(id.uuidString) else {
+            guard let previous = NotepadIdentity.previous,
+                  let legacy = try readData(id.uuidString, service: previous) else {
                 throw keychainError(errSecItemNotFound)
             }
             guard let password = String(data: legacy, encoding: .utf8) else {
@@ -36,7 +64,7 @@ enum Vault {
             }
             entries[id.uuidString] = password
             try save(entries)
-            try? remove(id.uuidString)
+            try? remove(id.uuidString, service: previous)
             return password
         }
     }
@@ -52,7 +80,9 @@ enum Vault {
     static func delete(_ id: UUID) throws {
         try withLock {
             var entries = try load()
-            try remove(id.uuidString)
+            if let previous = NotepadIdentity.previous {
+                try remove(id.uuidString, service: previous)
+            }
             if entries.removeValue(forKey: id.uuidString) != nil {
                 try save(entries)
             }
@@ -60,8 +90,16 @@ enum Vault {
     }
 
     private static func load() throws -> [String: String] {
-        guard let data = try readData(sharedAccount) else { return [:] }
-        return try JSONDecoder().decode([String: String].self, from: data)
+        let decoder = JSONDecoder()
+        var entries = try readData(sharedAccount).map { try decoder.decode([String: String].self, from: $0) } ?? [:]
+        if let previous = NotepadIdentity.previous,
+           let legacy = try readData(sharedAccount, service: previous) {
+            let olderEntries = try decoder.decode([String: String].self, from: legacy)
+            entries.merge(olderEntries) { current, _ in current }
+            try save(entries)
+            try remove(sharedAccount, service: previous)
+        }
+        return entries
     }
 
     private static func save(_ entries: [String: String]) throws {
@@ -74,14 +112,14 @@ enum Vault {
         guard status == errSecSuccess else { throw keychainError(status) }
     }
 
-    private static func query(_ account: String) -> [String: Any] {
+    private static func query(_ account: String, service: String = service) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: service,
          kSecAttrAccount as String: account]
     }
 
-    private static func readData(_ account: String) throws -> Data? {
-        var request = query(account)
+    private static func readData(_ account: String, service: String = service) throws -> Data? {
+        var request = query(account, service: service)
         request[kSecReturnData as String] = true
         var result: CFTypeRef?
         let status = SecItemCopyMatching(request as CFDictionary, &result)
@@ -92,8 +130,8 @@ enum Vault {
         return data
     }
 
-    private static func remove(_ account: String) throws {
-        let status = SecItemDelete(query(account) as CFDictionary)
+    private static func remove(_ account: String, service: String) throws {
+        let status = SecItemDelete(query(account, service: service) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw keychainError(status)
         }
@@ -121,6 +159,7 @@ enum Vault {
 
 final class NotepadLifecycle: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NotepadIdentity.importPreferences()
         let appPath = Bundle.main.bundleURL.standardizedFileURL.path
         guard !appPath.hasPrefix("/Volumes/"),
               !appPath.contains("/AppTranslocation/"),
