@@ -12,12 +12,14 @@ struct Access: Identifiable, Codable {
     var icon = "git.branch"
     var link = ""
     var description: String?
+    var groupID: UUID?
 }
 
 struct Note: Identifiable, Codable {
     var id = UUID()
     var name: String?
     var textColor: NoteTextColor?
+    var isAccessGroup: Bool?
     var text = ""
 }
 
@@ -336,7 +338,13 @@ struct NotepadView: View {
 
     private let icons = ["externaldrive", "switch.2", "git.branch", "server.rack", "house", "key"]
     private let iconLabels = ["VPS", "3x-UI", "GitHub", "Сервер", "Админка", "Другое"]
-    private var accesses: [Access] { panel.accesses }
+    private var selectedNote: Note? { notes.first { $0.id == panel.selected } }
+    private var isAccessTab: Bool { panel.selected == nil || selectedNote?.isAccessGroup == true }
+    private var accesses: [Access] { panel.accesses.filter { $0.groupID == panel.selected } }
+
+    private var cardColor: NoteTextColor {
+        selectedNote?.textColor ?? accessTextColor
+    }
     private var notes: [Note] {
         (try? JSONDecoder().decode([Note].self, from: notesData)) ?? [Note(), Note()]
     }
@@ -362,52 +370,68 @@ struct NotepadView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack {
                         ForEach(Array(notes.enumerated()), id: \.element.id) { index, note in
-                            noteTab(note, defaultName: "Лист \(index + 1)")
+                            noteTab(note, defaultName: defaultTabName(note, index: index))
                         }
-                        Button {
-                            let note = Note()
-                            storeNotes(notes + [note])
-                            select(note.id)
-                        } label: { Image(systemName: "plus") }
-                        .accessibilityLabel("Добавить лист")
+                        Menu {
+                            Button("Текстовый лист") { addTab(isAccessGroup: false) }
+                            Button("Лист доступов") { addTab(isAccessGroup: true) }
+                        } label: {
+                            Image(systemName: "plus")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .accessibilityLabel("Добавить вкладку")
                     }
                 }
-                if panel.selected == nil {
-                    paletteButton("Цвет текста доступов", color: accessTextColor)
+                if isAccessTab {
+                    paletteButton("Цвет текста доступов", color: cardColor)
                     iconButton("plus", label: "Добавить доступ", color: Palette.accent) {
                         panel.hidePassword()
                         panel.cancelPasswordEdit()
-                        panel.editing = Access()
+                        panel.editing = Access(groupID: panel.selected)
                         panel.password = ""
                         panel.status = ""
                     }
                     .disabled(panel.editing != nil)
                 } else if let id = panel.selected {
                     paletteButton("Цвет текста листа", color: noteColor(id))
+                }
+                if let id = panel.selected {
                     iconButton("trash", label: "Удалить открытый лист", role: .destructive) {
                         let currentNotes = notes
                         guard let index = currentNotes.firstIndex(where: { $0.id == id }) else { return }
-                        let name = currentNotes[index].name ?? "Лист \(index + 1)"
+                        let name = currentNotes[index].name ?? defaultTabName(currentNotes[index], index: index)
                         panel.deleting = .note(id, name: name)
                     }
                     .disabled(panel.renaming != nil)
                 }
             }.padding(10)
             Divider()
-            if let selected = panel.selected {
-                TextEditor(text: Binding(
-                    get: { notes.first { $0.id == selected }?.text ?? "" },
-                    set: { text in
-                        var updated = notes
-                        guard let index = updated.firstIndex(where: { $0.id == selected }) else { return }
-                        updated[index].text = text
-                        storeNotes(updated)
+            if !isAccessTab, let selected = panel.selected {
+                let noteText = notes.first { $0.id == selected }?.text ?? ""
+                HStack(alignment: .top, spacing: 6) {
+                    TextEditor(text: Binding(
+                        get: { notes.first { $0.id == selected }?.text ?? "" },
+                        set: { text in
+                            var updated = notes
+                            guard let index = updated.firstIndex(where: { $0.id == selected }) else { return }
+                            if !panel.status.isEmpty { panel.status = "" }
+                            updated[index].text = text
+                            storeNotes(updated)
+                        }
+                    ))
+                    .foregroundColor(noteColor(selected).color)
+                    .accessibilityLabel("Текст заметки")
+
+                    iconButton(panel.status == "Лист скопирован" ? "checkmark" : "square.on.square",
+                               label: "Скопировать весь лист", color: Palette.copyIcon) {
+                        copy(noteText, label: "Лист", secret: true)
                     }
-                ))
-                .foregroundColor(noteColor(selected).color)
-                .accessibilityLabel("Текст заметки")
-                .padding(10)
-                .frame(height: contentHeight)
+                    .disabled(noteText.isEmpty)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(height: contentHeight, alignment: .top)
             } else {
                 VStack(alignment: .leading, spacing: accessStatusSpacing) {
                     ZStack(alignment: .topLeading) {
@@ -423,11 +447,9 @@ struct NotepadView: View {
                     .accessibilityHidden(panel.editing != nil)
                     .overlay {
                         if let editing = panel.editing {
-                            ScrollView {
-                                editor(editing)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .background(Palette.paper)
+                            editor(editing)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                                .background(Palette.paper)
                         }
                     }
                     Text(panel.status)
@@ -453,7 +475,9 @@ struct NotepadView: View {
                     }
                 }
             case let .note(id, name):
-                deletionPopup("Удалить лист?", name: name, detail: "Текст листа будет удалён.") {
+                let group = notes.first { $0.id == id }?.isAccessGroup == true
+                deletionPopup("Удалить лист?", name: name,
+                              detail: group ? "Карточки переместятся в основные «Доступы»." : "Текст листа будет удалён.") {
                     deleteNote(id)
                 }
             case nil:
@@ -588,11 +612,36 @@ struct NotepadView: View {
         if let encoded = try? JSONEncoder().encode(notes) { notesData = encoded }
     }
 
+    private func defaultTabName(_ note: Note, index: Int) -> String {
+        note.isAccessGroup == true ? "Доступы \(index + 1)" : "Лист \(index + 1)"
+    }
+
+    private func addTab(isAccessGroup: Bool) {
+        let note = Note(isAccessGroup: isAccessGroup ? true : nil)
+        let current = notes
+        storeNotes(current + [note])
+        startRename(note.id, name: defaultTabName(note, index: current.count))
+    }
+
     private func deleteNote(_ id: UUID) {
         var updated = notes
         guard let index = updated.firstIndex(where: { $0.id == id }) else {
             panel.deleting = nil
             return
+        }
+        if updated[index].isAccessGroup == true {
+            var cards = panel.accesses
+            for index in cards.indices where cards[index].groupID == id {
+                cards[index].groupID = nil
+            }
+            do {
+                accessesData = try JSONEncoder().encode(cards)
+                panel.accesses = cards
+            } catch {
+                panel.deleting = nil
+                panel.status = error.localizedDescription
+                return
+            }
         }
         updated.remove(at: index)
         storeNotes(updated)
@@ -669,36 +718,32 @@ struct NotepadView: View {
                 } else {
                     Image(systemName: access.icon)
                 }
-                Text(access.title).fontWeight(.semibold).lineLimit(2).foregroundStyle(accessTextColor.color).help(access.title)
+                Text(access.title).fontWeight(.semibold).lineLimit(2).foregroundStyle(cardColor.color).help(access.title)
                 Spacer(minLength: 0)
                 iconButton("square.on.square", label: "Скопировать название или адрес", color: Palette.copyIcon) {
                     copy(access.title, label: "Адрес или название", success: "Скопировано")
                 }
+                .scaleEffect(2.0 / 3.0, anchor: .trailing)
             }
-            credentialRow("Логин", value: access.login) {
-                copy(access.login, label: "Логин")
+            if !access.login.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                credentialRow("Логин", value: access.login) {
+                    copy(access.login, label: "Логин")
+                }
             }
             passwordRow(access)
-            Button {
-                startAccessEdit(access)
-            } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Описание").foregroundStyle(.secondary)
-                    if let description = access.description, !description.isEmpty {
-                        Text(description)
-                            .foregroundStyle(accessTextColor.color)
-                            .lineLimit(3)
-                    }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Описание").foregroundStyle(.secondary)
+                if let description = access.description, !description.isEmpty {
+                    Text(description)
+                        .foregroundStyle(cardColor.color)
+                        .lineLimit(3)
                 }
-                .font(.caption)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .help("Редактировать описание")
+            .font(.caption)
+            .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 0)
             HStack(spacing: 6) {
-                iconButton("slider.horizontal.3", label: "Изменить доступ") {
+                iconButton("square.and.pencil", label: "Изменить доступ и описание") {
                     startAccessEdit(access)
                 }
                 Spacer(minLength: 0)
@@ -731,11 +776,12 @@ struct NotepadView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.caption).foregroundStyle(.secondary)
                 Text(value).lineLimit(multiline ? nil : 1).truncationMode(.middle)
-                    .foregroundStyle(accessTextColor.color).textSelection(.enabled)
+                    .foregroundStyle(cardColor.color).textSelection(.enabled)
             }
             Spacer(minLength: 0)
             iconButton("square.on.square", label: "Скопировать: " + name.lowercased(),
                        color: Palette.copyIcon, action: action)
+                .scaleEffect(2.0 / 3.0, anchor: .trailing)
         }
     }
 
@@ -854,10 +900,16 @@ struct NotepadView: View {
         let existing = accesses.contains { $0.id == access.id }
         return VStack(alignment: .leading, spacing: 7) {
             Text(existing ? "Изменить доступ" : "Добавить доступ").fontWeight(.semibold)
-            TextField("Название", text: field(\.title))
-            TextField("Логин", text: field(\.login))
-            SecureField(existing ? "Новый пароль (необязательно)" : "Пароль", text: $panel.password)
-            TextField("Ссылка (необязательно)", text: field(\.link))
+            HStack(spacing: 10) {
+                VStack(spacing: 7) {
+                    TextField("Название", text: field(\.title))
+                    TextField("Логин (необязательно)", text: field(\.login))
+                }
+                VStack(spacing: 7) {
+                    SecureField(existing ? "Новый пароль (необязательно)" : "Пароль", text: $panel.password)
+                    TextField("Ссылка (необязательно)", text: field(\.link))
+                }
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text("Описание (необязательно)").foregroundStyle(.secondary)
                 TextEditor(text: Binding(
@@ -870,15 +922,18 @@ struct NotepadView: View {
                 .accessibilityLabel("Описание")
             }
             .font(.caption)
-            Picker("Значок", selection: field(\.icon)) {
-                ForEach(icons.indices, id: \.self) { index in
-                    Text(iconLabels[index]).tag(icons[index])
-                }
-            }
+            Spacer(minLength: 0)
             HStack {
+                Picker("Значок", selection: field(\.icon)) {
+                    ForEach(icons.indices, id: \.self) { index in
+                        Text(iconLabels[index]).tag(icons[index])
+                    }
+                }
+                .fixedSize()
+                Spacer()
                 Button("Сохранить") { save() }
                     .disabled(access.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                              access.login.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!existing && panel.password.isEmpty))
+                              (!existing && panel.password.isEmpty))
                 Button("Отмена") { panel.editing = nil; panel.password = ""; panel.status = "" }
             }
         }
@@ -891,7 +946,7 @@ struct NotepadView: View {
 
     private func save() {
         guard let access = panel.editing else { return }
-        var updated = accesses
+        var updated = panel.accesses
         if let index = updated.firstIndex(where: { $0.id == access.id }) { updated[index] = access }
         else { updated.append(access) }
         do {
@@ -909,7 +964,7 @@ struct NotepadView: View {
 
     private func delete(_ id: UUID) {
         do {
-            let remaining = accesses.filter { $0.id != id }
+            let remaining = panel.accesses.filter { $0.id != id }
             let encoded = try JSONEncoder().encode(remaining)
             try Vault.delete(id)
             accessesData = encoded
